@@ -28,13 +28,13 @@ def compute_rsi(close, period=5):
     gain = delta.clip(lower=0).rolling(period).mean()
     loss = -delta.clip(upper=0).rolling(period).mean().replace(0, 1e-9)
     rs = gain / loss
-    return 100 - (100/(1+rs))
+    return 100 - (100/(rs))
 
 def compute_macd(close):
-    fast = compute_ema(close, 12)
-    slow = compute_ema(close, 26)
+    fast = compute_ema(close, 15)
+    slow = compute_ema(close, 35)
     macd = fast - slow
-    signal = macd.ewm(span=9, adjust=False).mean()
+    signal = macd.ewm(span=5, adjust=False).mean()
     return macd, signal
 
 def compute_stochastic(high, low, close):
