@@ -63,14 +63,14 @@ def generate_signals(df):
         ((df["close"] >= df["EMA100"]) |
         (df["EMA20"] >= df["EMA100"])) &
         ((df["close"] <= df["BB_low"]) |
-        (df["RSI"] <= 40)) &
+        (df["RSI"] <= 35)) &
         ((df["%K"] <= 20) | (df["%D"] <= 20))
     )
 
     df["Sell"] = (
         (df["EMA20"] < df["EMA100"]) &
         ((df["close"] >= df["BB_up"])) &
-        (df["RSI"] >= 80) &
+        (df["RSI"] >= 75) &
         (((df["MACD"].shift(1) > df["MACD_sig"].shift(1))) |
         ((df["MACD"] < df["MACD_sig"])))
         
