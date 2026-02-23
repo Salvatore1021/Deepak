@@ -4,7 +4,10 @@ import lightgbm as lgb
 import importlib
 
 # Dynamically import the repo's main file since python module names usually can't start with numbers
-repo_code = importlib.import_module("80lpa")
+try:
+    repo_code = importlib.import_module("80lpa")
+except ImportError:
+    pass
 
 
 # ==========================================================
@@ -18,7 +21,6 @@ def create_features(df):
 
         # Current Day Returns
         group['returns'] = group['close'].pct_change().dropna()
-
 
         # Volatility Adjusted Momentum
         vol_21 = group['returns'].rolling(21).std()
@@ -47,7 +49,6 @@ def create_features(df):
     full_df = pd.concat(df_list)
 
     # Critical Fix: Only dropna on features. DO NOT dropna on target_return
-    # otherwise we lose the ability to predict on the most recent day.
     feature_cols = ['sharpe_mom', 'dist_sma_50', 'rsi_14', 'ret_lag_1', 'ret_lag_3', 'ret_lag_5', 'ret_lag_10']
     full_df = full_df.dropna(subset=feature_cols)
     return full_df
@@ -115,88 +116,34 @@ def train_and_predict(df):
         eval_at=[1]
     )
 
-    test['predicted_score'] = model.predict(test[features])
-
-
-# ==========================================================
-# TRANSLATE ML SCORES TO REPO SIGNALS
-# ==========================================================
-
-def generate_signals(df):
-    # Initialize signal columns
-    df['Buy'] = False
-    df['Sell'] = False
-
-    # --- PORTFOLIO RULES ---
-    TARGET_POSITIONS = 10  # Diversify risk across up to 10 stocks (Limits: 1 to 100)
-    SELL_RANK_THRESHOLD = 30  # Only sell if the stock drops below the Top 30
-
-    # Keep track of what we currently own to apply hysteresis (stickiness)
-    current_holdings = set()
-
-    # Ensure data is sorted chronologically for accurate state tracking
-    df = df.sort_values(['tradedate', 'index_name'])
-
-    for date, group in df.groupby('tradedate'):
-        # Stricter Regime Filter: Stock MUST be trading above its 50-day SMA
-        valid_candidates = group[group['dist_sma_50'] > 0].copy()
-
-        if valid_candidates.empty:
-            # If the market is crashing, sell everything and hold 100% cash
-            sell_idx = group[group['index_name'].isin(current_holdings)].index
-            df.loc[sell_idx, 'Sell'] = True
-            current_holdings.clear()
-            continue
-
-        # Rank today's valid candidates based on the ML score (1 is highest score)
-        valid_candidates['daily_rank'] = valid_candidates['predicted_score'].rank(ascending=False, method='first')
-
-        # ==========================================
-        # 1. PROCESS SELLS FIRST
-        # ==========================================
-        sells_today = []
-        for stock in list(current_holdings):
-            # Sell Rule A: The stock dropped below its 50-day SMA (no longer in valid_candidates)
-            if stock not in valid_candidates['index_name'].values:
-                sells_today.append(stock)
-            else:
-                # Sell Rule B: The stock's ML rank has deteriorated past our threshold
-                stock_rank = valid_candidates.loc[valid_candidates['index_name'] == stock, 'daily_rank'].values[0]
-                if stock_rank > SELL_RANK_THRESHOLD:
-                    sells_today.append(stock)
-
-        # Execute Sells
-        if sells_today:
-            # Match the stock names back to the dataframe index for this specific date
-            sell_idx = group[group['index_name'].isin(sells_today)].index
-            df.loc[sell_idx, 'Sell'] = True
-            for stock in sells_today:
-                current_holdings.remove(stock)
-
-        # ==========================================
-        # 2. PROCESS BUYS
-        # ==========================================
-        # Calculate how many slots are open in our 10-stock portfolio
-        open_slots = TARGET_POSITIONS - len(current_holdings)
-
-        if open_slots > 0:
-            # Filter out stocks we already own
-            potential_buys = valid_candidates[~valid_candidates['index_name'].isin(current_holdings)]
-
-            # Select the absolute best remaining stocks to fill the empty slots
-            top_buys = potential_buys.nsmallest(open_slots, 'daily_rank')
-
-            if not top_buys.empty:
-                buy_idx = top_buys.index
-                df.loc[buy_idx, 'Buy'] = True
-                for stock in top_buys['index_name'].values:
-                    current_holdings.add(stock)
+    # Predict on the full dataframe so we have scores for all data
+    df['predicted_score'] = model.predict(df[features])
 
     return df
 
 
 # ==========================================================
-# MAIN EXECUTION (USING REPO'S UNMODIFIED BACKTESTER)
+# TRANSLATE ML SCORES TO SIGMOID VALUES FOR ENSEMBLE
+# ==========================================================
+
+def generate_signals(df):
+    """
+    Transforms the raw LightGBM ranking scores into bounded sigmoid probabilities.
+    Returns the dataframe with the new 'sigmoid_score' column.
+    """
+    df = df.copy()
+
+    # Apply Sigmoid function: 1 / (1 + e^-x)
+    df['sigmoid_score'] = 1 / (1 + np.exp(-df['predicted_score']))
+
+    # Ensure data is sorted for easy merging later
+    df = df.sort_values(['tradedate', 'index_name']).reset_index(drop=True)
+
+    return df
+
+
+# ==========================================================
+# MAIN EXECUTION
 # ==========================================================
 
 def main():
@@ -214,34 +161,22 @@ def main():
     # 3. Train & Predict
     df_with_scores = train_and_predict(df_features)
 
-    # 4. Generate 'Buy'/'Sell' booleans
-    data_signals = generate_signals(df_with_scores)
+    # 4. Generate Sigmoid Scores
+    print("Calculating Sigmoid Scores for Ensemble...")
+    data_with_sigmoid = generate_signals(df_with_scores)
 
-    # 5. Route strictly to repo's unmodified compliant backtest logic
-    print("\nRunning Team's Official Backtest Engine...")
-    equity_curve, trade_log, turnover = repo_code.run_backtest(data_signals)
-    metrics, full_df = repo_code.analyze_performance(equity_curve, data)
+    # 5. Save the output so your ensemble script can load it
+    output_filename = "model_1_sigmoid_scores.csv"
 
-    # 6. Generate repo's required standard outputs
-    equity_curve.to_csv("equity_curve.csv", index=False)
-    trade_log.to_csv("trade_log.csv", index=False)
-    full_df[["Date", "Drawdown"]].to_csv("drawdown_curve.csv", index=False)
-    pd.DataFrame(metrics, index=[0]).to_csv("performance_metrics.csv", index=False)
+    # Extracting just the necessary columns to keep the file lightweight for the ensemble
+    ensemble_df = data_with_sigmoid[
+        ['tradedate', 'index_name', 'close', 'predicted_score', 'sigmoid_score', 'dist_sma_50']]
+    ensemble_df.to_csv(output_filename, index=False)
 
-    rolling_table = pd.DataFrame({
-        "Date": full_df["Date"],
-        "Roll_1Y": repo_code.compute_rolling_series(full_df, 252),
-        "Roll_3Y": repo_code.compute_rolling_series(full_df, 756),
-        "Roll_5Y": repo_code.compute_rolling_series(full_df, 1260)
-    })
-    rolling_table.to_csv("rolling_outperformance.csv", index=False)
-    pd.DataFrame({"Turnover": [turnover]}).to_csv("turnover.csv", index=False)
+    print(f"\nSuccess! Sigmoid scores saved to {output_filename}.")
+    print(ensemble_df)
 
-    print("\n===== ML PERFORMANCE METRICS =====")
-    for k, v in metrics.items():
-        print(f"{k}: {v:.6f}")
-    print(f"\nPortfolio Turnover: {turnover:.4f}")
-
+    return data_with_sigmoid
 
 if __name__ == "__main__":
-    main()
+    df_scores = main()
