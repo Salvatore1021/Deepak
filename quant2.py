@@ -17,7 +17,8 @@ def create_features(df):
         group = group.copy()
 
         # Current Day Returns
-        group['returns'] = group['close'].pct_change()
+        group['returns'] = group['close'].pct_change().dropna()
+
 
         # Volatility Adjusted Momentum
         vol_21 = group['returns'].rolling(21).std()
@@ -32,7 +33,7 @@ def create_features(df):
         gain = (delta.where(delta > 0, 0)).rolling(14).mean()
         loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
         rs = gain / loss
-        group['rsi_14'] = 100 - (100 / (1 + rs))
+        group['rsi_14'] = 100 - (100 / rs)
 
         # Lagged Returns (Pattern Recognition)
         for lag in [1, 3, 5, 10]:
@@ -77,18 +78,18 @@ def train_and_predict(df):
     df = prepare_ranking_labels(df)
 
     # Dynamic Validation Split: Automatically uses first 70% of dates for training
-    # to avoid hardcoding dates (ensures it won't crash on unseen 2020-2025 data)
     unique_dates = df['tradedate'].sort_values().unique()
     split_idx = int(len(unique_dates) * 0.7)
     split_date = unique_dates[split_idx]
 
-    train = df[df['tradedate'] < split_date]
-    test = df[df['tradedate'] >= split_date]
+    # Use .copy() to ensure we safely manipulate these slices later
+    train = df[df['tradedate'] < split_date].copy()
+    test = df[df['tradedate'] >= split_date].copy()
 
     # Fallback if the dataset is too small
     if train.empty:
-        train = df
-        test = df
+        train = df.copy()
+        test = df.copy()
 
     qids_train = train.groupby("tradedate")["tradedate"].count().to_numpy()
     qids_test = test.groupby("tradedate")["tradedate"].count().to_numpy()
@@ -114,9 +115,7 @@ def train_and_predict(df):
         eval_at=[1]
     )
 
-    # Predict on the entire dataframe so we can backtest the whole period cleanly
-    df['predicted_score'] = model.predict(df[features])
-    return df
+    test['predicted_score'] = model.predict(test[features])
 
 
 # ==========================================================
@@ -124,24 +123,74 @@ def train_and_predict(df):
 # ==========================================================
 
 def generate_signals(df):
+    # Initialize signal columns
     df['Buy'] = False
     df['Sell'] = False
 
+    # --- PORTFOLIO RULES ---
+    TARGET_POSITIONS = 10  # Diversify risk across up to 10 stocks (Limits: 1 to 100)
+    SELL_RANK_THRESHOLD = 30  # Only sell if the stock drops below the Top 30
+
+    # Keep track of what we currently own to apply hysteresis (stickiness)
+    current_holdings = set()
+
+    # Ensure data is sorted chronologically for accurate state tracking
+    df = df.sort_values(['tradedate', 'index_name'])
+
     for date, group in df.groupby('tradedate'):
-        valid_candidates = group[group['dist_sma_50'] > -0.01]
+        # Stricter Regime Filter: Stock MUST be trading above its 50-day SMA
+        valid_candidates = group[group['dist_sma_50'] > 0].copy()
 
-        buy_indices = []  # Default to empty if no valid candidates
+        if valid_candidates.empty:
+            # If the market is crashing, sell everything and hold 100% cash
+            sell_idx = group[group['index_name'].isin(current_holdings)].index
+            df.loc[sell_idx, 'Sell'] = True
+            current_holdings.clear()
+            continue
 
-        if not valid_candidates.empty:
-            # Adaptive Top 1 asset logic
-            top_asset = valid_candidates.sort_values('predicted_score', ascending=False).head(1)
-            buy_indices = top_asset.index
-            df.loc[buy_indices, 'Buy'] = True
+        # Rank today's valid candidates based on the ML score (1 is highest score)
+        valid_candidates['daily_rank'] = valid_candidates['predicted_score'].rank(ascending=False, method='first')
 
-        # Sell Logic: Any asset not selected as Top 1 today must be sold
-        # Using group.index prevents scanning the massive whole dataframe
-        sell_indices = group.index.difference(buy_indices)
-        df.loc[sell_indices, 'Sell'] = True
+        # ==========================================
+        # 1. PROCESS SELLS FIRST
+        # ==========================================
+        sells_today = []
+        for stock in list(current_holdings):
+            # Sell Rule A: The stock dropped below its 50-day SMA (no longer in valid_candidates)
+            if stock not in valid_candidates['index_name'].values:
+                sells_today.append(stock)
+            else:
+                # Sell Rule B: The stock's ML rank has deteriorated past our threshold
+                stock_rank = valid_candidates.loc[valid_candidates['index_name'] == stock, 'daily_rank'].values[0]
+                if stock_rank > SELL_RANK_THRESHOLD:
+                    sells_today.append(stock)
+
+        # Execute Sells
+        if sells_today:
+            # Match the stock names back to the dataframe index for this specific date
+            sell_idx = group[group['index_name'].isin(sells_today)].index
+            df.loc[sell_idx, 'Sell'] = True
+            for stock in sells_today:
+                current_holdings.remove(stock)
+
+        # ==========================================
+        # 2. PROCESS BUYS
+        # ==========================================
+        # Calculate how many slots are open in our 10-stock portfolio
+        open_slots = TARGET_POSITIONS - len(current_holdings)
+
+        if open_slots > 0:
+            # Filter out stocks we already own
+            potential_buys = valid_candidates[~valid_candidates['index_name'].isin(current_holdings)]
+
+            # Select the absolute best remaining stocks to fill the empty slots
+            top_buys = potential_buys.nsmallest(open_slots, 'daily_rank')
+
+            if not top_buys.empty:
+                buy_idx = top_buys.index
+                df.loc[buy_idx, 'Buy'] = True
+                for stock in top_buys['index_name'].values:
+                    current_holdings.add(stock)
 
     return df
 
